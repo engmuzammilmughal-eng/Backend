@@ -1,0 +1,534 @@
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import { fetch } from "undici";
+import { promises as dns } from "node:dns";
+import ipaddr from "ipaddr.js";
+import path from "node:path";
+import fs from "node:fs";
+import { spawn } from "node:child_process";
+import tmp from "tmp";
+import ffmpegPath from "ffmpeg-static";
+
+tmp.setGracefulCleanup();
+
+const app = express();
+
+// ===== Config =====
+const PORT = process.env.PORT || 3000;
+
+// Comma-separated allowed origins (Blogger domains etc). If empty => allow all.
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+
+// For safety: max remote content-length to allow proxy download (bytes). 0 = no limit.
+const MAX_CONTENT_LENGTH = Number(process.env.MAX_CONTENT_LENGTH || 0);
+
+// ===== Middleware =====
+app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(express.json({ limit: "1mb" }));
+
+app.use(
+  cors({
+    origin: CORS_ORIGIN === "*" ? "*" : CORS_ORIGIN.split(",").map(s => s.trim()),
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"]
+  })
+);
+
+// ===== Helpers =====
+const ALLOWED_EXT = [
+  "mp4", "mov", "webm", "m4v", "3gp", "mkv",
+  "mp3", "wav",
+  "srt", "vtt",
+  "jpg", "jpeg", "png"
+];
+
+function jsonOk(res, data) {
+  res.json({ ok: true, ...data });
+}
+
+function jsonErr(res, status, msg) {
+  res.status(status).json({ ok: false, error: msg });
+}
+
+function getExtFromUrl(u) {
+  try {
+    const url = new URL(u);
+    const p = url.pathname || "";
+    const ext = p.split(".").pop()?.toLowerCase() || "";
+    return ext;
+  } catch {
+    return "";
+  }
+}
+
+function sanitizeFileName(name) {
+  return (name || "file")
+    .replace(/[\/\\?%*:|"<>]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function nameFromUrl(u) {
+  const url = new URL(u);
+  const base = path.basename(url.pathname || "") || "media-file";
+  return sanitizeFileName(decodeURIComponent(base));
+}
+
+function isDirectMediaUrl(u) {
+  let url;
+  try { url = new URL(u); } catch { return false; }
+  if (!["http:", "https:"].includes(url.protocol)) return false;
+
+  const ext = getExtFromUrl(u);
+  if (!ext || !ALLOWED_EXT.includes(ext)) return false;
+
+  return true;
+}
+
+/**
+ * SSRF protection: block localhost / private IPs by DNS lookup.
+ * (Still not perfect, but good baseline.)
+ */
+async function assertPublicHost(u) {
+  const url = new URL(u);
+  const hostname = url.hostname;
+
+  // Basic blocks
+  if (
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local")
+  ) {
+    throw new Error("Blocked host");
+  }
+
+  const { address } = await dns.lookup(hostname, { family: 0 });
+
+  const addr = ipaddr.parse(address);
+  const range = addr.range(); // "private", "loopback", "linkLocal", etc.
+
+  const blocked = new Set([
+    "private",
+    "loopback",
+    "linkLocal",
+    "uniqueLocal",
+    "carrierGradeNat",
+    "reserved",
+    "multicast",
+    "unspecified"
+  ]);
+
+  if (blocked.has(range)) {
+    throw new Error("Blocked IP range");
+  }
+}
+
+function resolutionToScale(resLabel) {
+  const r = (resLabel || "").toLowerCase();
+  if (r === "240p") return "scale=-2:240";
+  if (r === "360p") return "scale=-2:360";
+  if (r === "480p") return "scale=-2:480";
+  if (r === "hd") return "scale=1280:720";
+  if (r === "full hd") return "scale=1920:1080";
+  if (r === "4k") return "scale=3840:2160";
+  return null;
+}
+
+function mimeByExt(ext) {
+  const e = (ext || "").toLowerCase();
+  if (e === "mp4" || e === "m4v") return "video/mp4";
+  if (e === "mov") return "video/quicktime";
+  if (e === "webm") return "video/webm";
+  if (e === "3gp") return "video/3gpp";
+  if (e === "mkv") return "video/x-matroska";
+  if (e === "mp3") return "audio/mpeg";
+  if (e === "wav") return "audio/wav";
+  if (e === "jpg" || e === "jpeg") return "image/jpeg";
+  if (e === "png") return "image/png";
+  if (e === "srt") return "application/x-subrip";
+  if (e === "vtt") return "text/vtt";
+  return "application/octet-stream";
+}
+
+async function headInfo(u) {
+  const res = await fetch(u, { method: "HEAD", redirect: "follow" });
+  if (!res.ok) throw new Error(`Upstream HEAD failed (${res.status})`);
+
+  const contentType = res.headers.get("content-type") || "";
+  const contentLength = res.headers.get("content-length");
+  const len = contentLength ? Number(contentLength) : null;
+
+  if (MAX_CONTENT_LENGTH && len && len > MAX_CONTENT_LENGTH) {
+    throw new Error("File too large for this server limit");
+  }
+
+  return { contentType, contentLength: len };
+}
+
+function tempFile(ext) {
+  return new Promise((resolve, reject) => {
+    tmp.file({ postfix: ext ? `.${ext}` : "" }, (err, filePath, fd, cleanup) => {
+      if (err) return reject(err);
+      resolve({ filePath, cleanup });
+    });
+  });
+}
+
+async function runFfmpegToFile(args, outPath) {
+  if (!ffmpegPath) throw new Error("ffmpeg binary not found");
+
+  return new Promise((resolve, reject) => {
+    const p = spawn(ffmpegPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+    let stderr = "";
+    p.stderr.on("data", d => (stderr += d.toString()));
+
+    p.on("error", reject);
+    p.on("close", code => {
+      if (code !== 0) return reject(new Error(stderr || `ffmpeg failed (${code})`));
+      if (!fs.existsSync(outPath)) return reject(new Error("Output not created"));
+      resolve();
+    });
+  });
+}
+
+// ===== Routes =====
+app.get("/health", (req, res) => res.send("ok"));
+
+/**
+ * GET /api/info?url=
+ * Returns { fileName, contentType, mimeType, sizeMB, duration:null }
+ */
+app.get("/api/info", async (req, res) => {
+  try {
+    const url = String(req.query.url || "").trim();
+    if (!url) return jsonErr(res, 400, "Missing url");
+    if (!isDirectMediaUrl(url)) return jsonErr(res, 400, "Direct media file URL required");
+    await assertPublicHost(url);
+
+    const { contentType, contentLength } = await headInfo(url);
+
+    const fileName = nameFromUrl(url);
+    const sizeMB = contentLength ? (contentLength / 1048576).toFixed(2) : null;
+
+    jsonOk(res, {
+      fileName,
+      contentType,
+      mimeType: contentType,
+      sizeMB,
+      duration: null
+    });
+  } catch (e) {
+    jsonErr(res, 500, e.message || "Failed");
+  }
+});
+
+/**
+ * GET /api/filesize?url=
+ */
+app.get("/api/filesize", async (req, res) => {
+  try {
+    const url = String(req.query.url || "").trim();
+    if (!url) return jsonErr(res, 400, "Missing url");
+    if (!isDirectMediaUrl(url)) return jsonErr(res, 400, "Direct media file URL required");
+    await assertPublicHost(url);
+
+    const { contentType, contentLength } = await headInfo(url);
+    const sizeMB = contentLength ? (contentLength / 1048576).toFixed(2) : null;
+
+    jsonOk(res, { contentType, sizeMB });
+  } catch (e) {
+    jsonErr(res, 500, e.message || "Failed");
+  }
+});
+
+/**
+ * GET /api/download?url=
+ * Streams upstream file via backend with attachment headers.
+ */
+app.get("/api/download", async (req, res) => {
+  try {
+    const url = String(req.query.url || "").trim();
+    if (!url) return jsonErr(res, 400, "Missing url");
+    if (!isDirectMediaUrl(url)) return jsonErr(res, 400, "Direct media file URL required");
+    await assertPublicHost(url);
+
+    const upstream = await fetch(url, { method: "GET", redirect: "follow" });
+    if (!upstream.ok) return jsonErr(res, 502, `Upstream failed (${upstream.status})`);
+
+    const contentType = upstream.headers.get("content-type") || "application/octet-stream";
+    const contentLength = upstream.headers.get("content-length");
+    const fileName = nameFromUrl(url);
+
+    if (MAX_CONTENT_LENGTH && contentLength && Number(contentLength) > MAX_CONTENT_LENGTH) {
+      return jsonErr(res, 413, "File too large for this server limit");
+    }
+
+    res.setHeader("Content-Type", contentType);
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+    res.setHeader("X-Filename", fileName);
+
+    // Stream body
+    upstream.body.pipe(res);
+  } catch (e) {
+    jsonErr(res, 500, e.message || "Failed");
+  }
+});
+
+/**
+ * POST /api/thumbnail { url }
+ * Returns JPEG binary
+ */
+app.post("/api/thumbnail", async (req, res) => {
+  try {
+    const url = String(req.body?.url || "").trim();
+    if (!url) return jsonErr(res, 400, "Missing url");
+    if (!isDirectMediaUrl(url)) return jsonErr(res, 400, "Direct media file URL required");
+    await assertPublicHost(url);
+
+    const { filePath, cleanup } = await tempFile("jpg");
+    const outName = "thumbnail.jpg";
+
+    // Generate thumbnail at 1s
+    const args = [
+      "-hide_banner", "-y",
+      "-user_agent", "VidoLuxBackend/1.0",
+      "-ss", "00:00:01",
+      "-i", url,
+      "-frames:v", "1",
+      "-q:v", "2",
+      filePath
+    ];
+
+    await runFfmpegToFile(args, filePath);
+
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Content-Disposition", `attachment; filename="${outName}"`);
+    res.setHeader("X-Filename", outName);
+
+    const stat = fs.statSync(filePath);
+    res.setHeader("Content-Length", String(stat.size));
+
+    fs.createReadStream(filePath)
+      .on("close", () => cleanup())
+      .pipe(res);
+  } catch (e) {
+    jsonErr(res, 500, e.message || "Thumbnail failed");
+  }
+});
+
+/**
+ * POST /api/extract-audio { url, format:"mp3" }
+ * Returns MP3 binary
+ */
+app.post("/api/extract-audio", async (req, res) => {
+  try {
+    const url = String(req.body?.url || "").trim();
+    if (!url) return jsonErr(res, 400, "Missing url");
+    if (!isDirectMediaUrl(url)) return jsonErr(res, 400, "Direct media file URL required");
+    await assertPublicHost(url);
+
+    const { filePath, cleanup } = await tempFile("mp3");
+    const outName = "audio.mp3";
+
+    const args = [
+      "-hide_banner", "-y",
+      "-user_agent", "VidoLuxBackend/1.0",
+      "-i", url,
+      "-vn",
+      "-codec:a", "libmp3lame",
+      "-q:a", "4",
+      filePath
+    ];
+
+    await runFfmpegToFile(args, filePath);
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Disposition", `attachment; filename="${outName}"`);
+    res.setHeader("X-Filename", outName);
+
+    const stat = fs.statSync(filePath);
+    res.setHeader("Content-Length", String(stat.size));
+
+    fs.createReadStream(filePath)
+      .on("close", () => cleanup())
+      .pipe(res);
+  } catch (e) {
+    jsonErr(res, 500, e.message || "Audio extraction failed");
+  }
+});
+
+/**
+ * POST /api/convert { url, format, resolution }
+ * Returns converted file
+ */
+app.post("/api/convert", async (req, res) => {
+  try {
+    const url = String(req.body?.url || "").trim();
+    const format = String(req.body?.format || "mp4").trim().toLowerCase();
+    const resolution = String(req.body?.resolution || "").trim();
+
+    if (!url) return jsonErr(res, 400, "Missing url");
+    if (!isDirectMediaUrl(url)) return jsonErr(res, 400, "Direct media file URL required");
+    await assertPublicHost(url);
+
+    if (!["mp4", "m4v", "mov", "webm", "3gp"].includes(format)) {
+      return jsonErr(res, 400, "Unsupported format");
+    }
+
+    const { filePath, cleanup } = await tempFile(format);
+    const outName = `converted.${format}`;
+
+    const scale = resolutionToScale(resolution);
+    const vf = scale ? ["-vf", scale] : [];
+
+    // Codec choices (best-effort)
+    let vcodec = ["-c:v", "libx264"];
+    let acodec = ["-c:a", "aac", "-b:a", "128k"];
+
+    if (format === "webm") {
+      // needs libvpx-vp9 in ffmpeg build
+      vcodec = ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "34"];
+      acodec = ["-c:a", "libopus", "-b:a", "96k"];
+    } else if (format === "3gp") {
+      vcodec = ["-c:v", "libx264"];
+      acodec = ["-c:a", "aac", "-b:a", "96k"];
+    }
+
+    const args = [
+      "-hide_banner", "-y",
+      "-user_agent", "VidoLuxBackend/1.0",
+      "-i", url,
+      ...vf,
+      ...vcodec,
+      ...acodec,
+      "-movflags", "+faststart",
+      filePath
+    ];
+
+    await runFfmpegToFile(args, filePath);
+
+    res.setHeader("Content-Type", mimeByExt(format));
+    res.setHeader("Content-Disposition", `attachment; filename="${outName}"`);
+    res.setHeader("X-Filename", outName);
+
+    const stat = fs.statSync(filePath);
+    res.setHeader("Content-Length", String(stat.size));
+
+    fs.createReadStream(filePath)
+      .on("close", () => cleanup())
+      .pipe(res);
+  } catch (e) {
+    jsonErr(res, 500, e.message || "Convert failed");
+  }
+});
+
+/**
+ * POST /api/compress { url, format, resolution }
+ * Returns compressed file (same idea as convert but higher CRF)
+ */
+app.post("/api/compress", async (req, res) => {
+  try {
+    const url = String(req.body?.url || "").trim();
+    const format = String(req.body?.format || "mp4").trim().toLowerCase();
+    const resolution = String(req.body?.resolution || "").trim();
+
+    if (!url) return jsonErr(res, 400, "Missing url");
+    if (!isDirectMediaUrl(url)) return jsonErr(res, 400, "Direct media file URL required");
+    await assertPublicHost(url);
+
+    if (!["mp4", "m4v", "mov", "webm"].includes(format)) {
+      return jsonErr(res, 400, "Unsupported format");
+    }
+
+    const { filePath, cleanup } = await tempFile(format);
+    const outName = `compressed.${format}`;
+
+    const scale = resolutionToScale(resolution);
+    const vf = scale ? ["-vf", scale] : [];
+
+    let args;
+    if (format === "webm") {
+      args = [
+        "-hide_banner", "-y",
+        "-user_agent", "VidoLuxBackend/1.0",
+        "-i", url,
+        ...vf,
+        "-c:v", "libvpx-vp9",
+        "-b:v", "0",
+        "-crf", "40",
+        "-c:a", "libopus",
+        "-b:a", "64k",
+        filePath
+      ];
+    } else {
+      args = [
+        "-hide_banner", "-y",
+        "-user_agent", "VidoLuxBackend/1.0",
+        "-i", url,
+        ...vf,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "30",
+        "-c:a", "aac",
+        "-b:a", "96k",
+        "-movflags", "+faststart",
+        filePath
+      ];
+    }
+
+    await runFfmpegToFile(args, filePath);
+
+    res.setHeader("Content-Type", mimeByExt(format));
+    res.setHeader("Content-Disposition", `attachment; filename="${outName}"`);
+    res.setHeader("X-Filename", outName);
+
+    const stat = fs.statSync(filePath);
+    res.setHeader("Content-Length", String(stat.size));
+
+    fs.createReadStream(filePath)
+      .on("close", () => cleanup())
+      .pipe(res);
+  } catch (e) {
+    jsonErr(res, 500, e.message || "Compress failed");
+  }
+});
+
+/**
+ * POST /api/subtitles { url }
+ * If url is .srt/.vtt direct file, returns quick info (UI-friendly)
+ */
+app.post("/api/subtitles", async (req, res) => {
+  try {
+    const url = String(req.body?.url || "").trim();
+    if (!url) return jsonErr(res, 400, "Missing url");
+
+    const ext = getExtFromUrl(url);
+    if (!["srt", "vtt"].includes(ext)) {
+      return jsonErr(res, 400, "Direct subtitle (.srt/.vtt) URL required");
+    }
+    await assertPublicHost(url);
+
+    const r = await fetch(url, { method: "GET", redirect: "follow" });
+    if (!r.ok) return jsonErr(res, 502, `Upstream failed (${r.status})`);
+
+    const text = await r.text();
+    const lines = text.split(/\r?\n/).filter(Boolean).length;
+
+    jsonOk(res, {
+      fileName: nameFromUrl(url),
+      format: ext.toUpperCase(),
+      lines,
+      note: "Subtitle loaded (direct file)."
+    });
+  } catch (e) {
+    jsonErr(res, 500, e.message || "Subtitles failed");
+  }
+});
+
+// ===== Start =====
+app.listen(PORT, () => {
+  console.log(`VidoLux backend running on port ${PORT}`);
+});
